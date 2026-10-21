@@ -40,7 +40,7 @@ if USE_POSTGRES:
 else:
     logger.info("Using local SQLite database (reseller_smm.db)")
 
-# ==================== COLORFUL & PREMIUM EMOJIS ====================
+# ==================== COLORFUL EMOJIS ====================
 E_GREEN = "🟢"
 E_RED = "🔴"
 E_YELLOW = "🟡"
@@ -68,7 +68,7 @@ services_cache = {
     "by_id": {},
     "last_updated": 0
 }
-CACHE_TTL = 600  # 10 minutes cache
+CACHE_TTL = 600
 
 
 async def init_db():
@@ -402,7 +402,6 @@ async def cb_platform_services(call: CallbackQuery):
         sid = s["service"]
         name = s["name"]
         rate = s["reseller_rate"]
-        # Short & fully visible button text with colorful green indicator
         btn_label = f"{E_GREEN} #{sid} | {name[:24]} ({rate:,.0f} UZS)"
         rows.append([InlineKeyboardButton(text=btn_label, callback_data=f"srv:{sid}:{plat_name}:{page}")])
 
@@ -970,7 +969,7 @@ async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
 
     await state.set_state(BroadcastFlow.waiting_message)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Bekor qilish", callback_data="admin:panel")]])
-    await safe_edit(call, f"📢 <b>Barcha foydalanuvchilarga yuboriladigan xabarni kiriting (Matn, rasm yoki video):</b>", kb)
+    await safe_edit(call, f"📢 <b>Barcha foydalanuvchilarga yuboriladigan xabarni kiriting:</b>", kb)
 
 
 @router.message(BroadcastFlow.waiting_message, F.from_user.id == ADMIN_ID)
@@ -1056,7 +1055,7 @@ async def cmd_broadcast(message: Message, state: FSMContext):
 async def cmd_add_balance(message: Message):
     parts = message.text.split()
     if len(parts) < 3:
-        return await message.answer("⚠️ Ishlatish: `/add <amount_uzs> <userid>`", parse_mode="Markdown")
+        return await message.answer("⚠️ Ishlatish: `/add <amount_uzs> <userid>`")
 
     try:
         amount = float(parts[1])
@@ -1107,7 +1106,7 @@ async def main():
     dp.include_router(router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Starting Telegram Bot Polling (aiogram 3.25.0)...")
+    logger.info("Starting Telegram Bot Polling (aiogram 3.13.1)...")
     await dp.start_polling(bot)
 
 
