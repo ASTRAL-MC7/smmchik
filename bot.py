@@ -22,25 +22,20 @@ from aiogram.exceptions import TelegramBadRequest
 # ==================== CONFIGURATION & ENV ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 SMM_API_KEY = os.getenv("SMM_API_KEY", "")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 SMM_API_URL = "https://kometa-smm.uz/api/v2"
 
 ADMIN_ID = 5523761749
-MARKUP = 1.70  # +70% Reseller Markup
+
+# Pricing Settings
+MARKUP = 1.70  # +70% Reseller Markup (e.g., 1000 UZS becomes 1700 UZS)
 UZS_PER_STAR = int(os.getenv("UZS_PER_STAR", "250"))
 PORT = int(os.getenv("PORT", "8080"))
+DB_PATH = "reseller_smm.db"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-USE_POSTGRES = bool(DATABASE_URL)
-if USE_POSTGRES:
-    import asyncpg
-    logger.info("Using PostgreSQL database via DATABASE_URL")
-else:
-    logger.info("Using local SQLite database (reseller_smm.db)")
-
-# ==================== COLORFUL EMOJIS ====================
+# ==================== COLORFUL & PREMIUM EMOJIS ====================
 E_GREEN = "🟢"
 E_RED = "🔴"
 E_YELLOW = "🟡"
@@ -68,111 +63,63 @@ services_cache = {
     "by_id": {},
     "last_updated": 0
 }
-CACHE_TTL = 600
+CACHE_TTL = 600  # 10 minutes cache
 
 
 async def init_db():
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    balance DOUBLE PRECISION DEFAULT 0.0,
-                    total_spent DOUBLE PRECISION DEFAULT 0.0
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    api_order_id BIGINT,
-                    service_id INTEGER,
-                    service_name TEXT,
-                    link TEXT,
-                    quantity INTEGER,
-                    charge DOUBLE PRECISION,
-                    status TEXT DEFAULT 'Pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    balance REAL DEFAULT 0.0,
-                    total_spent REAL DEFAULT 0.0
-                )
-            """)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    api_order_id INTEGER,
-                    service_id INTEGER,
-                    service_name TEXT,
-                    link TEXT,
-                    quantity INTEGER,
-                    charge REAL,
-                    status TEXT DEFAULT 'Pending',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance REAL DEFAULT 0.0,
+                total_spent REAL DEFAULT 0.0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                api_order_id INTEGER,
+                service_id INTEGER,
+                service_name TEXT,
+                link TEXT,
+                quantity INTEGER,
+                charge REAL,
+                status TEXT DEFAULT 'Pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
 
 
 async def get_user_balance(user_id: int) -> float:
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             if not row:
-                await conn.execute("INSERT INTO users (user_id, balance) VALUES ($1, 0.0) ON CONFLICT (user_id) DO NOTHING", user_id)
+                await db.execute("INSERT INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
+                await db.commit()
                 return 0.0
-            return round(float(row["balance"]), 2)
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cur:
-                row = await cur.fetchone()
-                if not row:
-                    await db.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, 0.0)", (user_id,))
-                    await db.commit()
-                    return 0.0
-                return round(float(row[0]), 2)
+            return round(float(row[0]), 2)
 
 
 async def update_user_balance(user_id: int, delta: float):
-    await get_user_balance(user_id)
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            if delta < 0:
-                await conn.execute(
-                    "UPDATE users SET balance = balance + $1, total_spent = total_spent + $2 WHERE user_id = $3",
-                    delta, abs(delta), user_id
-                )
-            else:
-                await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id = $2", delta, user_id)
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            if delta < 0:
-                await db.execute(
-                    "UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id = ?",
-                    (delta, abs(delta), user_id)
-                )
-            else:
-                await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id))
-            await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await get_user_balance(user_id)  # Ensure user exists
+        if delta < 0:
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, total_spent = total_spent + ? WHERE user_id = ?",
+                (delta, abs(delta), user_id)
+            )
+        else:
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                (delta, user_id)
+            )
+        await db.commit()
 
 
-# ==================== SMM API CLIENT ====================
+# ==================== KOMETA SMM API CLIENT ====================
 async def smm_request(payload: dict):
     payload["key"] = SMM_API_KEY
     timeout = aiohttp.ClientTimeout(total=30)
@@ -236,7 +183,7 @@ class BroadcastFlow(StatesGroup):
     waiting_message = State()
 
 
-# ==================== KEYBOARDS ====================
+# ==================== KEYBOARD BUILDERS ====================
 def main_menu_kb(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=f"{E_GREEN} 🛍 Xizmatlar Katalogi", callback_data="catalog:main")],
@@ -305,21 +252,12 @@ async def cb_home(call: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "menu:balance")
 async def cb_balance(call: CallbackQuery):
     bal = await get_user_balance(call.from_user.id)
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            row = await conn.fetchrow("SELECT total_spent FROM users WHERE user_id = $1", call.from_user.id)
-            spent = float(row["total_spent"]) if row else 0.0
-            cnt = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE user_id = $1", call.from_user.id)
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT total_spent FROM users WHERE user_id = ?", (call.from_user.id,)) as cur:
-                row = await cur.fetchone()
-                spent = float(row[0]) if row else 0.0
-            async with db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (call.from_user.id,)) as cur:
-                cnt = (await cur.fetchone())[0]
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT total_spent FROM users WHERE user_id = ?", (call.from_user.id,)) as cur:
+            row = await cur.fetchone()
+            spent = float(row[0]) if row else 0.0
+        async with db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (call.from_user.id,)) as cur:
+            cnt = (await cur.fetchone())[0]
 
     text = (
         f"{E_DIAMOND} <b>Shaxsiy Kabinet</b>\n\n"
@@ -595,24 +533,13 @@ async def cb_order_confirm(call: CallbackQuery, state: FSMContext):
         cache = await get_services()
         s_name = cache["by_id"].get(sid, {}).get("name", f"Service #{sid}")
 
-        if USE_POSTGRES:
-            conn = await asyncpg.connect(DATABASE_URL)
-            try:
-                await conn.execute(
-                    "INSERT INTO orders (user_id, api_order_id, service_id, service_name, link, quantity, charge, status) "
-                    "VALUES ($1, $2, $3, $4, $5, $6, $7, 'Pending')",
-                    call.from_user.id, api_order_id, sid, s_name, link, qty, charge
-                )
-            finally:
-                await conn.close()
-        else:
-            async with aiosqlite.connect("reseller_smm.db") as db:
-                await db.execute(
-                    "INSERT INTO orders (user_id, api_order_id, service_id, service_name, link, quantity, charge, status) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')",
-                    (call.from_user.id, api_order_id, sid, s_name, link, qty, charge)
-                )
-                await db.commit()
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO orders (user_id, api_order_id, service_id, service_name, link, quantity, charge, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')",
+                (call.from_user.id, api_order_id, sid, s_name, link, qty, charge)
+            )
+            await db.commit()
 
         new_bal = await get_user_balance(call.from_user.id)
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -648,39 +575,22 @@ async def cb_orders_list(call: CallbackQuery):
     per_page = 6
     offset = page * per_page
 
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            total = await conn.fetchval("SELECT COUNT(*) FROM orders WHERE user_id = $1", call.from_user.id)
-            rows_db = await conn.fetch(
-                "SELECT api_order_id, service_name, quantity, charge, status FROM orders "
-                "WHERE user_id = $1 ORDER BY id DESC LIMIT $2 OFFSET $3",
-                call.from_user.id, per_page, offset
-            )
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (call.from_user.id,)) as cur:
-                total = (await cur.fetchone())[0]
-            async with db.execute(
-                "SELECT api_order_id, service_name, quantity, charge, status FROM orders "
-                "WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
-                (call.from_user.id, per_page, offset)
-            ) as cur:
-                rows_db = await cur.fetchall()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (call.from_user.id,)) as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT api_order_id, service_name, quantity, charge, status FROM orders "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (call.from_user.id, per_page, offset)
+        ) as cur:
+            rows_db = await cur.fetchall()
 
     if total == 0:
         return await safe_edit(call, f"{E_BOX} Sizda hali buyurtmalar yo'q.", back_home_kb())
 
     total_pages = (total + per_page - 1) // per_page
     kb_rows = []
-    for row in rows_db:
-        api_id = row["api_order_id"] if USE_POSTGRES else row[0]
-        s_name = row["service_name"] if USE_POSTGRES else row[1]
-        qty = row["quantity"] if USE_POSTGRES else row[2]
-        status = row["status"] if USE_POSTGRES else row[4]
-
+    for api_id, s_name, qty, charge, status in rows_db:
         icon = E_GREEN if status == "Completed" else (E_RED if status in ("Canceled", "Refunded") else E_YELLOW)
         kb_rows.append([InlineKeyboardButton(
             text=f"{icon} #{api_id} | {s_name[:16]} ({qty}) — {status}",
@@ -704,31 +614,17 @@ async def cb_orders_list(call: CallbackQuery):
 async def cb_order_detail(call: CallbackQuery):
     api_order_id = int(call.data.split(":")[1])
 
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            row = await conn.fetchrow(
-                "SELECT service_name, link, quantity, charge, status FROM orders WHERE user_id = $1 AND api_order_id = $2",
-                call.from_user.id, api_order_id
-            )
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute(
-                "SELECT service_name, link, quantity, charge, status FROM orders WHERE user_id = ? AND api_order_id = ?",
-                (call.from_user.id, api_order_id)
-            ) as cur:
-                row = await cur.fetchone()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT service_name, link, quantity, charge, status FROM orders WHERE user_id = ? AND api_order_id = ?",
+            (call.from_user.id, api_order_id)
+        ) as cur:
+            row = await cur.fetchone()
 
     if not row:
         return await call.answer("Buyurtma topilmadi!", show_alert=True)
 
-    s_name = row["service_name"] if USE_POSTGRES else row[0]
-    link = row["link"] if USE_POSTGRES else row[1]
-    qty = row["quantity"] if USE_POSTGRES else row[2]
-    charge = row["charge"] if USE_POSTGRES else row[3]
-    db_status = row["status"] if USE_POSTGRES else row[4]
+    s_name, link, qty, charge, db_status = row
 
     api_res = await smm_request({"action": "status", "order": api_order_id})
     start_count = "-"
@@ -753,16 +649,9 @@ async def cb_order_detail(call: CallbackQuery):
                 refund_note = f"\n\n{E_GREEN} <b>Qisman bajarildi: {refund_amt:,.2f} UZS qaytarildi!</b>"
 
         if live_status != db_status:
-            if USE_POSTGRES:
-                conn = await asyncpg.connect(DATABASE_URL)
-                try:
-                    await conn.execute("UPDATE orders SET status = $1 WHERE api_order_id = $2", live_status, api_order_id)
-                finally:
-                    await conn.close()
-            else:
-                async with aiosqlite.connect("reseller_smm.db") as db:
-                    await db.execute("UPDATE orders SET status = ? WHERE api_order_id = ?", (live_status, api_order_id))
-                    await db.commit()
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("UPDATE orders SET status = ? WHERE api_order_id = ?", (live_status, api_order_id))
+                await db.commit()
 
     text = (
         f"{E_BOX} <b>Buyurtma #{api_order_id}</b>\n\n"
@@ -904,23 +793,14 @@ async def cb_admin_stats(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer("Ruxsat yo'q!", show_alert=True)
 
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
-            orders_count = await conn.fetchval("SELECT COUNT(*) FROM orders")
-            total_spent = await conn.fetchval("SELECT SUM(total_spent) FROM users") or 0.0
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT COUNT(*) FROM users") as cur:
-                users_count = (await cur.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM orders") as cur:
-                orders_count = (await cur.fetchone())[0]
-            async with db.execute("SELECT SUM(total_spent) FROM users") as cur:
-                row = await cur.fetchone()
-                total_spent = row[0] if row and row[0] else 0.0
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM orders") as cur:
+            orders_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT SUM(total_spent) FROM users") as cur:
+            row = await cur.fetchone()
+            total_spent = row[0] if row and row[0] else 0.0
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:panel")]])
     await safe_edit(
@@ -938,24 +818,13 @@ async def cb_admin_orders(call: CallbackQuery):
     if call.from_user.id != ADMIN_ID:
         return await call.answer("Ruxsat yo'q!", show_alert=True)
 
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            rows = await conn.fetch("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10")
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10") as cur:
-                rows = await cur.fetchall()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10") as cur:
+            rows = await cur.fetchall()
 
     text = f"📦 <b>So'nggi 10 ta Buyurtma:</b>\n\n"
     for r in rows:
-        api_id = r["api_order_id"] if USE_POSTGRES else r[0]
-        u_id = r["user_id"] if USE_POSTGRES else r[1]
-        s_name = r["service_name"] if USE_POSTGRES else r[2]
-        qty = r["quantity"] if USE_POSTGRES else r[3]
-        status = r["status"] if USE_POSTGRES else r[4]
+        api_id, u_id, s_name, qty, status = r
         text += f"▪️ #{api_id} | User: <code>{u_id}</code> | {s_name[:12]} ({qty}) — <b>{status}</b>\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:panel")]])
@@ -975,17 +844,9 @@ async def cb_admin_broadcast(call: CallbackQuery, state: FSMContext):
 @router.message(BroadcastFlow.waiting_message, F.from_user.id == ADMIN_ID)
 async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            users = await conn.fetch("SELECT user_id FROM users")
-        finally:
-            await conn.close()
-        user_ids = [u["user_id"] for u in users]
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT user_id FROM users") as cur:
-                user_ids = [row[0] for row in await cur.fetchall()]
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            user_ids = [row[0] for row in await cur.fetchall()]
 
     success = 0
     fail = 0
@@ -1004,43 +865,24 @@ async def process_broadcast(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(Command("stats"), F.from_user.id == ADMIN_ID)
 async def cmd_stats(message: Message):
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            users_count = await conn.fetchval("SELECT COUNT(*) FROM users")
-            orders_count = await conn.fetchval("SELECT COUNT(*) FROM orders")
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT COUNT(*) FROM users") as cur:
-                users_count = (await cur.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM orders") as cur:
-                orders_count = (await cur.fetchone())[0]
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM orders") as cur:
+            orders_count = (await cur.fetchone())[0]
 
     await message.answer(f"📊 <b>Statistika:</b>\nFoydalanuvchilar: {users_count}\nBuyurtmalar: {orders_count}")
 
 
 @router.message(Command("orders"), F.from_user.id == ADMIN_ID)
 async def cmd_admin_orders(message: Message):
-    if USE_POSTGRES:
-        conn = await asyncpg.connect(DATABASE_URL)
-        try:
-            rows = await conn.fetch("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10")
-        finally:
-            await conn.close()
-    else:
-        async with aiosqlite.connect("reseller_smm.db") as db:
-            async with db.execute("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10") as cur:
-                rows = await cur.fetchall()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT api_order_id, user_id, service_name, quantity, status FROM orders ORDER BY id DESC LIMIT 10") as cur:
+            rows = await cur.fetchall()
 
     text = "📦 <b>So'nggi 10 ta buyurtma:</b>\n\n"
     for r in rows:
-        api_id = r["api_order_id"] if USE_POSTGRES else r[0]
-        u_id = r["user_id"] if USE_POSTGRES else r[1]
-        s_name = r["service_name"] if USE_POSTGRES else r[2]
-        qty = r["quantity"] if USE_POSTGRES else r[3]
-        status = r["status"] if USE_POSTGRES else r[4]
+        api_id, u_id, s_name, qty, status = r
         text += f"#{api_id} | {u_id} | {s_name[:12]} ({qty}) — {status}\n"
     await message.answer(text)
 
@@ -1077,7 +919,7 @@ async def cb_noop(call: CallbackQuery):
 async def health_check(request):
     return web.json_response({
         "status": "online",
-        "database": "PostgreSQL" if USE_POSTGRES else "SQLite",
+        "service": "SMM Reseller Bot (+70% Markup & Telegram Stars)",
         "cached_services": len(services_cache["data"])
     })
 
