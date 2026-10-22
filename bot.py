@@ -25,9 +25,10 @@ SMM_API_KEY = os.getenv("SMM_API_KEY", "")
 SMM_API_URL = "https://kometa-smm.uz/api/v2"
 
 ADMIN_ID = 5523761749
+CHANNEL_ID = -1003822385223
 
-# Pricing Settings
-MARKUP = 1.70  # +70% Reseller Markup (e.g., 1000 UZS becomes 1700 UZS)
+# Pricing Settings: add 2000 UZS to every original price
+PRICE_ADDITION = 2000.0
 # Exchange rate: How many UZS 1 Telegram Star gives the user in bot balance
 UZS_PER_STAR = int(os.getenv("UZS_PER_STAR", "250"))
 PORT = int(os.getenv("PORT", "8080"))
@@ -37,10 +38,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==================== PREMIUM EMOJIS CONFIG ====================
-# Note: Standard high-tier emojis are active out-of-the-box.
-# Note on Telegram API: InlineKeyboardButton text only supports standard Unicode emojis.
-# For message texts, if the bot owns a Fragment username or is operated carefully,
-# you can replace these with <tg-emoji emoji-id="YOUR_ID">⚡</tg-emoji> tags.
 E_FIRE = "🔥"
 E_STAR = "⭐️"
 E_DIAMOND = "💎"
@@ -143,9 +140,9 @@ async def get_services(force=False):
         cats = {}
         by_id = {}
         for s in res:
-            # Apply +70% markup to base rate
+            # Add 2000 UZS to the original rate
             orig_rate = float(s.get("rate", 0))
-            resell_rate = round(orig_rate * MARKUP, 2)
+            resell_rate = round(orig_rate + PRICE_ADDITION, 2)
             s["reseller_rate"] = resell_rate
 
             sid = int(s["service"])
@@ -747,7 +744,7 @@ async def cb_orders_list(call: CallbackQuery):
     if nav:
         kb_rows.append(nav)
 
-    kb_rows.append([InlineKeyboardButton(text=f"{E_BACK} Asosiy menyu", callback_data="menu:home")])
+    kb_rows.append([InlineKeyboardButton(text=f"{E_BACK} Asosiy menyu", callback_data="menu:home")] )
 
     await safe_edit(
         call,
@@ -758,7 +755,7 @@ async def cb_orders_list(call: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("ord:"))
-async def cb_order_detail(call: CallbackQuery):
+async def cb_order_detail(call: CallbackQuery, bot: Bot):
     api_order_id = int(call.data.split(":")[1])
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -797,6 +794,10 @@ async def cb_order_detail(call: CallbackQuery):
                 refund_amt = round((rem_int / qty) * charge, 2)
                 await update_user_balance(call.from_user.id, refund_amt)
                 refund_note = f"\n\n{E_CHECK} <b>Qisman bajarildi: yetkazilmagan {rem_int} ta uchun {refund_amt:,.2f} UZS qaytarildi!</b>"
+
+        # Check if transitioned to Completed right now
+        if live_status == "Completed" and db_status != "Completed":
+            await notify_order_completed(bot, call.from_user.id, api_order_id, s_name, qty, link)
 
         if live_status != db_status:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -855,6 +856,111 @@ async def cb_act_cancel(call: CallbackQuery):
             "✅ Bekor qilish so'rovi yuborildi! Birozdan so'ng 'Yangilash' tugmasini bosing.",
             show_alert=True
         )
+
+
+# ==================== NOTIFICATION HELPER ====================
+async def notify_order_completed(bot: Bot, user_id: int, api_order_id: int, service_name: str, qty: int, link: str):
+    user_msg = (
+        f"{E_CHECK} <b>Buyurtmangiz to'liq yetkazildi va yakunlandi!</b>\n\n"
+        f"🆔 <b>Buyurtma ID:</b> <code>#{api_order_id}</code>\n"
+        f"📌 <b>Xizmat:</b> {service_name}\n"
+        f"🔢 <b>Miqdor:</b> <code>{qty:,} ta</code>\n"
+        f"🔗 <b>Havola:</b> <code>{link}</code>\n\n"
+        f"<i>Xizmatimizdan foydalanganingiz uchun rahmat!</i>"
+    )
+
+    admin_channel_msg = (
+        f"🚀 <b>Yangi Buyurtma Bajarildi (Completed)!</b>\n\n"
+        f"🆔 <b>Buyurtma ID:</b> <code>#{api_order_id}</code>\n"
+        f"👤 <b>Foydalanuvchi:</b> <code>{user_id}</code>\n"
+        f"📌 <b>Xizmat:</b> {service_name}\n"
+        f"🔢 <b>Miqdor:</b> <code>{qty:,} ta</code>\n"
+        f"🔗 <b>Havola:</b> {link}\n"
+        f"📊 <b>Holat:</b> ✅ <b>Completed</b>"
+    )
+
+    # 1. User
+    try:
+        await bot.send_message(chat_id=user_id, text=user_msg)
+    except Exception as e:
+        logger.warning(f"Could not notify user {user_id}: {e}")
+
+    # 2. Admin
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=admin_channel_msg)
+    except Exception as e:
+        logger.warning(f"Could not notify admin: {e}")
+
+    # 3. Channel
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=admin_channel_msg)
+    except Exception as e:
+        logger.warning(f"Could not notify channel: {e}")
+
+
+# ==================== BACKGROUND ORDER CHECKER ====================
+async def check_orders_background(bot: Bot):
+    await asyncio.sleep(15)  # initial wait on startup
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT user_id, api_order_id, service_name, quantity, link, charge, status "
+                    "FROM orders WHERE status IN ('Pending', 'In progress')"
+                ) as cur:
+                    active_orders = await cur.fetchall()
+
+            for u_id, api_id, s_name, qty, link, charge, db_status in active_orders:
+                res = await smm_request({"action": "status", "order": api_id})
+                if isinstance(res, dict) and "status" in res:
+                    new_status = res["status"]
+                    remains = res.get("remains", "-")
+
+                    if new_status == "Completed":
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute("UPDATE orders SET status = 'Completed' WHERE api_order_id = ?", (api_id,))
+                            await db.commit()
+                        await notify_order_completed(bot, u_id, api_id, s_name, qty, link)
+
+                    elif new_status == "Canceled":
+                        await update_user_balance(u_id, charge)
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute("UPDATE orders SET status = 'Refunded' WHERE api_order_id = ?", (api_id,))
+                            await db.commit()
+                        try:
+                            await bot.send_message(
+                                chat_id=u_id,
+                                text=f"❌ Buyurtmangiz (#{api_id}) bekor qilindi. <code>{charge:,.2f} UZS</code> hisobingizga qaytarildi!"
+                            )
+                        except Exception:
+                            pass
+
+                    elif new_status == "Partial":
+                        rem_int = int(remains) if str(remains).isdigit() else 0
+                        refund_amt = round((rem_int / qty) * charge, 2) if 0 < rem_int <= qty else 0.0
+                        if refund_amt > 0:
+                            await update_user_balance(u_id, refund_amt)
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute("UPDATE orders SET status = 'Partial' WHERE api_order_id = ?", (api_id,))
+                            await db.commit()
+                        try:
+                            await bot.send_message(
+                                chat_id=u_id,
+                                text=f"⚠️ Buyurtmangiz (#{api_id}) qisman bajarildi. Bajarilmagan qism uchun <code>{refund_amt:,.2f} UZS</code> qaytarildi!"
+                            )
+                        except Exception:
+                            pass
+
+                    elif new_status != db_status:
+                        async with aiosqlite.connect(DB_PATH) as db:
+                            await db.execute("UPDATE orders SET status = ? WHERE api_order_id = ?", (new_status, api_id))
+                            await db.commit()
+
+                await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"Error in check_orders_background: {e}")
+
+        await asyncio.sleep(60)  # check once every minute
 
 
 # ==================== ADMIN PANEL & COMMANDS ====================
@@ -1009,7 +1115,7 @@ async def cb_noop(call: CallbackQuery):
 async def health_check(request):
     return web.json_response({
         "status": "online",
-        "service": "SMM Reseller Bot (+70% Markup & Telegram Stars)",
+        "service": "SMM Reseller Bot (+2000 UZS Fixed Markup & Telegram Stars)",
         "cached_services": len(services_cache["data"])
     })
 
@@ -1038,6 +1144,9 @@ async def main():
     bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    # Start the continuous background order completion checker
+    asyncio.create_task(check_orders_background(bot))
 
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Starting Telegram Bot Polling...")
